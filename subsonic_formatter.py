@@ -59,23 +59,42 @@ def format_playlists(toplists: List[Dict[str, Any]]) -> Element:
         playlist = SubElement(playlists_elem, "playlist")
         platform = toplist.get('platform') or 'netease'
         toplist_id = toplist.get('id') or ''
-        playlist_id = f"{platform}_{toplist_id}"
         
-        # Add platform prefix to name
-        original_name = toplist.get("name") or "Unknown"
-        platform_prefix = platform_names.get(platform, platform.upper())
-        display_name = f"{platform_prefix}-{original_name}"
-        
-        playlist.set("id", playlist_id)
-        playlist.set("name", display_name)
-        playlist.set("comment", toplist.get("description") or "TuneHub 音乐榜单")
-        playlist.set("songCount", str(toplist.get("trackCount") or 0))
-        playlist.set("duration", str((toplist.get("trackCount") or 0) * 200))
-        playlist.set("public", "true")
-        playlist.set("owner", "admin")
-        playlist.set("created", "2024-01-01T00:00:00.000Z")
-        playlist.set("changed", "2024-01-01T00:00:00.000Z")
-        playlist.set("coverArt", f"pl-{playlist_id}")
+        # User playlists keep their original ID (already has user_ prefix)
+        if platform == "user":
+            playlist_id = str(toplist_id)
+            display_name = toplist.get("name") or "Unknown"
+            song_count = toplist.get("songCount") or 0
+            
+            playlist.set("id", playlist_id)
+            playlist.set("name", display_name)
+            playlist.set("comment", "用户创建的歌单")
+            playlist.set("songCount", str(song_count))
+            playlist.set("duration", str(song_count * 200))
+            playlist.set("public", "false")  # Private playlist
+            playlist.set("owner", "admin")
+            playlist.set("created", "2024-01-01T00:00:00.000Z")
+            playlist.set("changed", "2024-01-01T00:00:00.000Z")
+            playlist.set("coverArt", f"pl-{playlist_id}")
+            # Add allowedUser to indicate this playlist is editable by admin
+            allowed_user = SubElement(playlist, "allowedUser")
+            allowed_user.text = "admin"
+        else:
+            playlist_id = f"{platform}_{toplist_id}"
+            original_name = toplist.get("name") or "Unknown"
+            platform_prefix = platform_names.get(platform, platform.upper())
+            display_name = f"{platform_prefix}-{original_name}"
+            
+            playlist.set("id", playlist_id)
+            playlist.set("name", display_name)
+            playlist.set("comment", toplist.get("description") or "TuneHub 音乐榜单")
+            playlist.set("songCount", str(toplist.get("trackCount") or 0))
+            playlist.set("duration", str((toplist.get("trackCount") or 0) * 200))
+            playlist.set("public", "true")
+            playlist.set("owner", "admin")
+            playlist.set("created", "2024-01-01T00:00:00.000Z")
+            playlist.set("changed", "2024-01-01T00:00:00.000Z")
+            playlist.set("coverArt", f"pl-{playlist_id}")
     
     return root
 
@@ -124,11 +143,11 @@ def format_search_result(songs: List[Dict[str, Any]], query: str = "") -> Elemen
         if ":" in song_id:
             platform = song_id.split(":")[0]
         
-        # Create a copy of song with modified title for search display
+        # Create a copy of song with platform prefix in artist name (not title)
         display_song = song.copy()
-        original_title = song.get("title", "Unknown")
+        original_artist = song.get("artist", "Unknown")
         if platform and platform in platform_names:
-            display_song["title"] = f"{platform_names[platform]} - {original_title}"
+            display_song["artist"] = f"{platform_names[platform]} - {original_artist}"
         
         _set_song_attributes(song_elem, display_song)
     

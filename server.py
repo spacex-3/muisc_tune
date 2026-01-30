@@ -144,9 +144,65 @@ def save_cache():
         except Exception as e:
             logger.error(f"Failed to save cache: {e}")
 
-# Initialize cache
-load_cache()
-atexit.register(save_cache)
+# Note: Cache initialization is done after werkzeug reloader check below
+
+# ============ User Data Storage (Playlists, Starred, Ratings) ============
+USER_DATA_FILE = "user_data.json"
+
+# User data structures
+user_playlists = {}  # {playlist_id: {name, songs: [song_ids], created}}
+starred_songs = set()  # Set of song IDs
+song_ratings = {}  # {song_id: rating (1-5)}
+
+def load_user_data():
+    """Load user data from disk"""
+    global user_playlists, starred_songs, song_ratings
+    try:
+        if os.path.exists(USER_DATA_FILE):
+            with open(USER_DATA_FILE, 'r') as f:
+                data = json.load(f)
+                user_playlists = data.get('playlists', {})
+                starred_songs = set(data.get('starred', []))
+                song_ratings = data.get('ratings', {})
+                logger.info(f"Loaded user data: {len(user_playlists)} playlists, {len(starred_songs)} starred, {len(song_ratings)} ratings")
+    except Exception as e:
+        logger.error(f"Failed to load user data: {e}")
+
+# Lock for user data operations
+user_data_lock = threading.Lock()
+
+def save_user_data():
+    """Save user data to disk"""
+    with user_data_lock:
+        try:
+            data = {
+                'playlists': dict(user_playlists),  # Copy to avoid race
+                'starred': list(starred_songs),
+                'ratings': dict(song_ratings)
+            }
+            # Write to temp file first, then rename (atomic operation)
+            temp_file = USER_DATA_FILE + ".tmp"
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            os.replace(temp_file, USER_DATA_FILE)
+            logger.info("Saved user data to disk")
+        except Exception as e:
+            logger.error(f"Failed to save user data: {e}")
+
+# ============ Initialize Data (only in worker process, not reloader parent) ============
+import os as _os
+_is_werkzeug_reloader_parent = app.debug and _os.environ.get('WERKZEUG_RUN_MAIN') != 'true'
+
+if not _is_werkzeug_reloader_parent:
+    # Worker process or non-debug mode: load data and register save on exit
+    load_cache()
+    atexit.register(save_cache)
+    load_user_data()
+    atexit.register(save_user_data)
+    logger.info("Cache and user data initialized (worker process)")
+else:
+    # Reloader parent: do NOT load or save - let worker handle it
+    logger.info("Skipping data init (reloader parent process)")
 
 def get_cached(cache: dict, key: str, ttl: int = CACHE_DURATION):
     """Get cached value if not expired"""
@@ -272,7 +328,17 @@ def get_playlists():
         cached_data = get_cached(playlist_cache, cache_key)
         if cached_data:
             logger.info(f"[CACHE HIT] Returning cached playlists for {platform}")
-            return make_response_from_element(format_playlists(cached_data))
+            # Always add user playlists at the beginning
+            all_playlists = []
+            for pl_id, pl_data in user_playlists.items():
+                all_playlists.append({
+                    "id": pl_id,
+                    "name": pl_data['name'],
+                    "platform": "user",
+                    "songCount": len(pl_data.get("songs", []))
+                })
+            all_playlists.extend(cached_data)
+            return make_response_from_element(format_playlists(all_playlists))
         
         logger.info(f"[API CALL] Fetching toplists from {platform}")
         all_toplists = []
@@ -310,7 +376,18 @@ def get_playlists():
         set_cached(playlist_cache, cache_key, filtered_toplists)
         logger.info(f"[CACHED] Stored {len(filtered_toplists)} playlists for {platform}")
         
-        return make_response_from_element(format_playlists(filtered_toplists))
+        # Add user playlists at the beginning
+        all_playlists = []
+        for pl_id, pl_data in user_playlists.items():
+            all_playlists.append({
+                "id": pl_id,
+                "name": pl_data['name'],  # Star prefix for user playlists
+                "platform": "user",
+                "songCount": len(pl_data.get("songs", []))
+            })
+        all_playlists.extend(filtered_toplists)
+        
+        return make_response_from_element(format_playlists(all_playlists))
     
     except Exception as e:
         logger.error(f"Error getting playlists: {e}")
@@ -327,6 +404,23 @@ def get_playlist():
         
         if not playlist_id:
             return make_response_from_element(format_error(10, "Required parameter is missing: id"))
+        
+        # Handle user-created playlists
+        if playlist_id.startswith("user_") and playlist_id in user_playlists:
+            pl_data = user_playlists[playlist_id]
+            songs = []
+            for song_id in pl_data.get("songs", []):
+                metadata = get_cached(song_metadata_cache, song_id)
+                if metadata:
+                    songs.append(metadata)
+            
+            logger.info(f"[USER PLAYLIST] Returning {len(songs)} songs from {pl_data['name']}")
+            return make_response_from_element(format_playlist(
+                playlist_id,
+                pl_data["name"],
+                songs,
+                ""
+            ))
         
         # Check cache first
         cache_key = f"playlist_detail_{playlist_id}"
@@ -830,13 +924,252 @@ def get_artists():
 @app.route("/rest/getStarred2.view", methods=["GET"])
 @require_auth
 def get_starred():
-    """Get starred items - returns empty for now"""
+    """Get starred songs from user data"""
+    from xml.etree.ElementTree import SubElement
+    from subsonic_formatter import create_subsonic_response, _set_song_attributes
+    
+    root = create_subsonic_response("ok")
+    starred_elem = SubElement(root, "starred2")
+    
+    # Add starred songs
+    for song_id in starred_songs:
+        metadata = get_cached(song_metadata_cache, song_id)
+        if metadata:
+            song_elem = SubElement(starred_elem, "song")
+            _set_song_attributes(song_elem, metadata)
+    
+    return make_response_from_element(root)
+
+
+@app.route("/rest/star", methods=["GET", "POST"])
+@app.route("/rest/star.view", methods=["GET", "POST"])
+@require_auth
+def star():
+    """Star a song, album, or artist"""
+    song_id = request.args.get("id", "")
+    album_id = request.args.get("albumId", "")
+    artist_id = request.args.get("artistId", "")
+    
+    # Star song
+    if song_id:
+        starred_songs.add(song_id)
+        logger.info(f"[STAR] Added: {song_id}")
+        save_user_data()
+    
+    return make_response_from_element(create_subsonic_response("ok"))
+
+
+@app.route("/rest/unstar", methods=["GET", "POST"])
+@app.route("/rest/unstar.view", methods=["GET", "POST"])
+@require_auth
+def unstar():
+    """Unstar a song, album, or artist"""
+    song_id = request.args.get("id", "")
+    
+    if song_id and song_id in starred_songs:
+        starred_songs.discard(song_id)
+        logger.info(f"[UNSTAR] Removed: {song_id}")
+        save_user_data()
+    
+    return make_response_from_element(create_subsonic_response("ok"))
+
+
+@app.route("/rest/setRating", methods=["GET", "POST"])
+@app.route("/rest/setRating.view", methods=["GET", "POST"])
+@require_auth
+def set_rating():
+    """Set rating for a song"""
+    song_id = request.args.get("id", "")
+    rating = request.args.get("rating", "0")
+    
+    try:
+        rating_val = int(rating)
+        if song_id:
+            if rating_val > 0:
+                song_ratings[song_id] = rating_val
+                logger.info(f"[RATING] Set {song_id} = {rating_val} stars")
+            else:
+                song_ratings.pop(song_id, None)
+                logger.info(f"[RATING] Removed rating for {song_id}")
+            save_user_data()
+    except ValueError:
+        pass
+    
+    return make_response_from_element(create_subsonic_response("ok"))
+
+
+@app.route("/rest/scrobble", methods=["GET", "POST"])
+@app.route("/rest/scrobble.view", methods=["GET", "POST"])
+@require_auth
+def scrobble():
+    """Record play - just acknowledge, no actual scrobbling"""
+    song_id = request.args.get("id", "")
+    submission = request.args.get("submission", "false")
+    
+    # Log but don't store (could implement play history later)
+    logger.info(f"[SCROBBLE] {song_id} (submission={submission})")
+    
+    return make_response_from_element(create_subsonic_response("ok"))
+
+
+@app.route("/rest/getRandomSongs", methods=["GET"])
+@app.route("/rest/getRandomSongs.view", methods=["GET"])
+@require_auth
+def get_random_songs():
+    """Get random songs from cached metadata"""
+    import random
+    from xml.etree.ElementTree import SubElement
+    from subsonic_formatter import create_subsonic_response, _set_song_attributes
+    
+    size = int(request.args.get("size", "50"))
+    
+    root = create_subsonic_response("ok")
+    random_songs_elem = SubElement(root, "randomSongs")
+    
+    # Get all cached song IDs
+    all_songs = list(song_metadata_cache.keys())
+    
+    if all_songs:
+        # Select random subset
+        sample_size = min(size, len(all_songs))
+        random_ids = random.sample(all_songs, sample_size)
+        
+        for song_id in random_ids:
+            metadata = get_cached(song_metadata_cache, song_id)
+            if metadata:
+                song_elem = SubElement(random_songs_elem, "song")
+                _set_song_attributes(song_elem, metadata)
+    
+    return make_response_from_element(root)
+
+
+@app.route("/rest/getSimilarSongs", methods=["GET"])
+@app.route("/rest/getSimilarSongs.view", methods=["GET"])
+@app.route("/rest/getSimilarSongs2", methods=["GET"])
+@app.route("/rest/getSimilarSongs2.view", methods=["GET"])
+@require_auth
+def get_similar_songs():
+    """Get similar songs - returns random songs from same platform"""
+    import random
+    from xml.etree.ElementTree import SubElement
+    from subsonic_formatter import create_subsonic_response, _set_song_attributes
+    
+    song_id = request.args.get("id", "")
+    count = int(request.args.get("count", "20"))
+    
+    root = create_subsonic_response("ok")
+    similar_elem = SubElement(root, "similarSongs2")
+    
+    # Determine platform from song ID
+    platform = ""
+    if ":" in song_id:
+        platform = song_id.split(":")[0]
+    
+    # Get songs from same platform
+    same_platform_songs = []
+    for sid in song_metadata_cache.keys():
+        if sid.startswith(f"{platform}:") and sid != song_id:
+            same_platform_songs.append(sid)
+    
+    if same_platform_songs:
+        sample_size = min(count, len(same_platform_songs))
+        random_ids = random.sample(same_platform_songs, sample_size)
+        
+        for sid in random_ids:
+            metadata = get_cached(song_metadata_cache, sid)
+            if metadata:
+                song_elem = SubElement(similar_elem, "song")
+                _set_song_attributes(song_elem, metadata)
+    
+    return make_response_from_element(root)
+
+
+@app.route("/rest/createPlaylist", methods=["GET", "POST"])
+@app.route("/rest/createPlaylist.view", methods=["GET", "POST"])
+@require_auth
+def create_playlist():
+    """Create a new playlist or add songs to existing"""
+    import uuid
     from xml.etree.ElementTree import SubElement
     from subsonic_formatter import create_subsonic_response
     
+    playlist_id = request.args.get("playlistId", "")
+    name = request.args.get("name", "")
+    song_ids = request.args.getlist("songId")
+    
+    if playlist_id and playlist_id in user_playlists:
+        # Add songs to existing playlist
+        user_playlists[playlist_id]["songs"].extend(song_ids)
+        logger.info(f"[PLAYLIST] Added {len(song_ids)} songs to {playlist_id}")
+    elif name:
+        # Create new playlist
+        new_id = f"user_{uuid.uuid4().hex[:8]}"
+        user_playlists[new_id] = {
+            "name": name,
+            "songs": song_ids,
+            "created": time.time()
+        }
+        playlist_id = new_id
+        logger.info(f"[PLAYLIST] Created new playlist: {name} ({new_id})")
+    
+    save_user_data()
+    
+    # Return playlist info
     root = create_subsonic_response("ok")
-    SubElement(root, "starred2")
+    if playlist_id and playlist_id in user_playlists:
+        pl_elem = SubElement(root, "playlist")
+        pl_elem.set("id", playlist_id)
+        pl_elem.set("name", user_playlists[playlist_id]["name"])
+        pl_elem.set("songCount", str(len(user_playlists[playlist_id]["songs"])))
+    
     return make_response_from_element(root)
+
+
+@app.route("/rest/updatePlaylist", methods=["GET", "POST"])
+@app.route("/rest/updatePlaylist.view", methods=["GET", "POST"])
+@require_auth
+def update_playlist():
+    """Update playlist (rename, add/remove songs)"""
+    playlist_id = request.args.get("playlistId", "")
+    name = request.args.get("name", "")
+    song_to_add = request.args.getlist("songIdToAdd")
+    song_index_to_remove = request.args.getlist("songIndexToRemove")
+    
+    if playlist_id and playlist_id in user_playlists:
+        if name:
+            user_playlists[playlist_id]["name"] = name
+        
+        # Add songs
+        if song_to_add:
+            user_playlists[playlist_id]["songs"].extend(song_to_add)
+        
+        # Remove by index (reverse order to preserve indices)
+        if song_index_to_remove:
+            indices = sorted([int(i) for i in song_index_to_remove], reverse=True)
+            for idx in indices:
+                if 0 <= idx < len(user_playlists[playlist_id]["songs"]):
+                    user_playlists[playlist_id]["songs"].pop(idx)
+        
+        save_user_data()
+        logger.info(f"[PLAYLIST] Updated: {playlist_id}")
+    
+    return make_response_from_element(create_subsonic_response("ok"))
+
+
+@app.route("/rest/deletePlaylist", methods=["GET", "POST"])
+@app.route("/rest/deletePlaylist.view", methods=["GET", "POST"])
+@require_auth
+def delete_playlist():
+    """Delete a playlist"""
+    playlist_id = request.args.get("id", "")
+    
+    if playlist_id and playlist_id in user_playlists:
+        del user_playlists[playlist_id]
+        save_user_data()
+        logger.info(f"[PLAYLIST] Deleted: {playlist_id}")
+    
+    return make_response_from_element(create_subsonic_response("ok"))
+
 
 
 @app.route("/rest/getInternetRadioStations", methods=["GET"])
@@ -997,4 +1330,4 @@ if __name__ == "__main__":
     logger.info(f"Default platform: {DEFAULT_PLATFORM}")
     logger.info(f"Default quality: {DEFAULT_QUALITY}")
     
-    app.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
