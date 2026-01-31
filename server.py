@@ -53,8 +53,11 @@ stream_url_cache = {}
 # Song metadata cache (from parse results)
 song_metadata_cache = {}
 
+# Data directory (for Docker: /app/cache, local: ./)
+DATA_DIR = os.environ.get("CACHE_DIR", os.path.dirname(__file__))
+
 # Local audio file cache directory
-AUDIO_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "audio")
+AUDIO_CACHE_DIR = os.path.join(DATA_DIR, "audio")
 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
 def get_audio_cache_path(song_id: str, quality: str) -> str:
@@ -124,7 +127,7 @@ def strip_platform_prefix(name: str) -> str:
 # Pending requests (to prevent duplicate API calls)
 pending_requests = set()
 
-CACHE_FILE = "server_cache.json"
+CACHE_FILE = os.path.join(DATA_DIR, "server_cache.json")
 
 def load_cache():
     """Load cache from disk"""
@@ -166,7 +169,7 @@ def save_cache():
 # Note: Cache initialization is done after werkzeug reloader check below
 
 # ============ User Data Storage (Playlists, Starred, Ratings) ============
-USER_DATA_FILE = "user_data.json"
+USER_DATA_FILE = os.path.join(DATA_DIR, "user_data.json")
 
 # User data structures
 user_playlists = {}  # {playlist_id: {name, songs: [song_ids], created}}
@@ -209,7 +212,7 @@ def save_user_data():
             logger.error(f"Failed to save user data: {e}")
 
 # ============ Credits Usage Logging ============
-CREDITS_LOG_FILE = "credits_log.json"
+CREDITS_LOG_FILE = os.path.join(DATA_DIR, "credits_log.json")
 credits_log = []  # List of credit usage records
 
 def load_credits_log():

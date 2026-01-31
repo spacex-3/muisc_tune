@@ -42,8 +42,17 @@ cp .env.example .env
 ### 使用 Docker Compose (推荐)
 
 ```bash
+# 创建目录
+mkdir -p config cache
+
 # 创建 .env 文件
-echo "TUNEHUB_API_KEY=your_api_key_here" > .env
+cat > .env << EOF
+TUNEHUB_API_KEY=your_api_key_here
+SUBSONIC_USER=admin
+SUBSONIC_PASSWORD=admin
+DEFAULT_QUALITY=flac
+AUDIO_CACHE_MAX_SIZE=10737418240
+EOF
 
 # 启动服务
 docker-compose up -d
@@ -61,10 +70,29 @@ docker run -d \
   -e TUNEHUB_API_KEY=your_api_key_here \
   -e SUBSONIC_USER=admin \
   -e SUBSONIC_PASSWORD=admin \
+  -e DEFAULT_QUALITY=flac \
+  -e AUDIO_CACHE_MAX_SIZE=10737418240 \
+  -v ./config:/app/config \
   -v ./cache:/app/cache \
-  -v ./data:/app/data \
   ghcr.io/spacex-3/music_tune:latest
 ```
+
+### 环境变量
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `TUNEHUB_API_KEY` | TuneHub API Key (必填) | - |
+| `SUBSONIC_USER` | Subsonic 用户名 | admin |
+| `SUBSONIC_PASSWORD` | Subsonic 密码 | admin |
+| `DEFAULT_QUALITY` | 默认音质 (128k/320k/flac/flac24bit) | flac |
+| `AUDIO_CACHE_MAX_SIZE` | 缓存大小限制 (字节) | 10737418240 (10GB) |
+
+### 挂载目录
+
+| 路径 | 说明 |
+|------|------|
+| `./config:/app/config` | 配置文件目录 |
+| `./cache:/app/cache` | 缓存目录 (音频/数据/日志) |
 
 ### 镜像地址
 
